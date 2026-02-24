@@ -17,11 +17,12 @@ type ExtensionManifest struct {
 	EntryPoint  string `json:"entryPoint,omitempty"`
 }
 
-// Extension is a loaded extension that can register tools and persist state.
+// Extension is a loaded extension that can register tools, hooks, and persist state.
 type Extension struct {
 	Manifest ExtensionManifest
 	Dir      string
 	Tools    []*AgentTool
+	Hooks    *ExtensionHooks
 	State    map[string]any
 	OnReload func(ext *Extension) error
 }
@@ -94,6 +95,13 @@ func (em *ExtensionManager) AllTools() []*AgentTool {
 		tools = append(tools, ext.Tools...)
 	}
 	return tools
+}
+
+// NewHookRunner creates a HookRunner that dispatches to all registered extensions.
+func (em *ExtensionManager) NewHookRunner() *HookRunner {
+	return NewHookRunner(func() []*Extension {
+		return em.All()
+	})
 }
 
 // SetState updates the state for an extension and persists it to the session.

@@ -202,4 +202,7 @@ type AgentLoopConfig struct {
 
 	// GetFollowUpMessages returns follow-up messages after the agent stops.
 	GetFollowUpMessages func() ([]AgentMessage, error)
+
+	// Hooks dispatches extension hook events during the agent loop.
+	Hooks *HookRunner
 }

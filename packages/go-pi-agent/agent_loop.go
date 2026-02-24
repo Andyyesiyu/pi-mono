@@ -44,11 +44,28 @@ func AgentLoop(
 			Messages:     make([]AgentMessage, 0, len(ctx.Messages)+len(prompts)),
 			Tools:        ctx.Tools,
 		}
+
+		// Run before_agent_start hooks (can modify system prompt)
+		if config.Hooks != nil {
+			hookResult := config.Hooks.RunBeforeAgentStart(&BeforeAgentStartHookEvent{
+				SystemPrompt: currentContext.SystemPrompt,
+			})
+			if hookResult != nil && hookResult.SystemPrompt != "" {
+				currentContext.SystemPrompt = hookResult.SystemPrompt
+			}
+		}
+
 		currentContext.Messages = append(currentContext.Messages, ctx.Messages...)
 		currentContext.Messages = append(currentContext.Messages, prompts...)
 
 		stream.Push(AgentEvent{Type: "agent_start"})
+		if config.Hooks != nil {
+			config.Hooks.RunAgentStart()
+		}
 		stream.Push(AgentEvent{Type: "turn_start"})
+		if config.Hooks != nil {
+			config.Hooks.RunTurnStart()
+		}
 		for i := range prompts {
 			stream.Push(AgentEvent{Type: "message_start", EventMessage: &prompts[i]})
 			stream.Push(AgentEvent{Type: "message_end", EventMessage: &prompts[i]})
@@ -86,8 +103,24 @@ func AgentLoopContinue(
 		}
 		copy(currentContext.Messages, ctx.Messages)
 
+		// Run before_agent_start hooks
+		if config.Hooks != nil {
+			hookResult := config.Hooks.RunBeforeAgentStart(&BeforeAgentStartHookEvent{
+				SystemPrompt: currentContext.SystemPrompt,
+			})
+			if hookResult != nil && hookResult.SystemPrompt != "" {
+				currentContext.SystemPrompt = hookResult.SystemPrompt
+			}
+		}
+
 		stream.Push(AgentEvent{Type: "agent_start"})
+		if config.Hooks != nil {
+			config.Hooks.RunAgentStart()
+		}
 		stream.Push(AgentEvent{Type: "turn_start"})
+		if config.Hooks != nil {
+			config.Hooks.RunTurnStart()
+		}
 
 		runLoop(currentContext, newMessages, config, signal, stream, streamFn)
 	}()
@@ -124,6 +157,9 @@ func runLoop(
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			if !firstTurn {
 				stream.Push(AgentEvent{Type: "turn_start"})
+				if config.Hooks != nil {
+					config.Hooks.RunTurnStart()
+				}
 			} else {
 				firstTurn = false
 			}
@@ -175,7 +211,7 @@ func runLoop(
 			if hasMoreToolCalls {
 				tr, steering := executeToolCalls(
 					currentContext.Tools, message, signal, stream,
-					config.GetSteeringMessages,
+					config.GetSteeringMessages, config.Hooks,
 				)
 				toolResults = tr
 				steeringAfterTools = steering
@@ -188,6 +224,12 @@ func runLoop(
 			}
 
 			stream.Push(AgentEvent{Type: "turn_end", TurnMessage: &am, ToolResults: toolResults})
+			if config.Hooks != nil {
+				config.Hooks.RunTurnEnd(&TurnEndHookEvent{
+					TurnMessage: &am,
+					ToolResults: toolResults,
+				})
+			}
 
 			// Get steering messages after turn completes
 			if len(steeringAfterTools) > 0 {
@@ -213,6 +255,9 @@ func runLoop(
 		break
 	}
 
+	if config.Hooks != nil {
+		config.Hooks.RunAgentEnd(&AgentEndHookEvent{Messages: newMessages})
+	}
 	stream.Push(AgentEvent{Type: "agent_end", Messages: newMessages})
 	stream.End(newMessages)
 }
@@ -232,6 +277,15 @@ func streamAssistantResponse(
 		messages, err = config.TransformContext(messages, signal)
 		if err != nil {
 			return nil, fmt.Errorf("transform context: %w", err)
+		}
+	}
+
+	// Run context hooks (extensions can modify messages before LLM call)
+	if config.Hooks != nil {
+		hookEvent := &ContextHookEvent{Messages: messages}
+		result := config.Hooks.RunContext(hookEvent)
+		if result != nil && result.Messages != nil {
+			messages = result.Messages
 		}
 	}
 
@@ -343,6 +397,7 @@ func executeToolCalls(
 	signal *ai.AbortSignal,
 	stream *AgentEventStream,
 	getSteeringMessages func() ([]AgentMessage, error),
+	hooks *HookRunner,
 ) ([]*ai.ToolResultMessage, []AgentMessage) {
 	var toolCalls []*ai.ToolCall
 	for i := range assistantMessage.Content {
@@ -364,6 +419,19 @@ func executeToolCalls(
 			}
 		}
 
+		// Run tool_call hook (can block execution)
+		blocked := false
+		if hooks != nil {
+			hookResult := hooks.RunToolCall(&ToolCallHookEvent{
+				ToolCallID: toolCall.ID,
+				ToolName:   toolCall.Name,
+				Input:      toolCall.Arguments,
+			})
+			if hookResult != nil && hookResult.Block {
+				blocked = true
+			}
+		}
+
 		stream.Push(AgentEvent{
 			Type:       "tool_execution_start",
 			ToolCallID: toolCall.ID,
@@ -374,7 +442,14 @@ func executeToolCalls(
 		var result *AgentToolResult
 		isError := false
 
-		if tool == nil {
+		if blocked {
+			result = &AgentToolResult{
+				Content: []ai.ToolResultContentBlock{
+					{Text: &ai.TextContent{Type: "text", Text: "Tool call blocked by extension hook."}},
+				},
+			}
+			isError = true
+		} else if tool == nil {
 			result = &AgentToolResult{
 				Content: []ai.ToolResultContentBlock{
 					{Text: &ai.TextContent{Type: "text", Text: fmt.Sprintf("Tool %s not found", toolCall.Name)}},
@@ -409,6 +484,29 @@ func executeToolCalls(
 						},
 					}
 					isError = true
+				}
+			}
+		}
+
+		// Run tool_result hook (can modify result)
+		if hooks != nil {
+			hookResult := hooks.RunToolResult(&ToolResultHookEvent{
+				ToolCallID: toolCall.ID,
+				ToolName:   toolCall.Name,
+				Input:      toolCall.Arguments,
+				Content:    result.Content,
+				Details:    result.Details,
+				IsError:    isError,
+			})
+			if hookResult != nil {
+				if hookResult.Content != nil {
+					result.Content = hookResult.Content
+				}
+				if hookResult.Details != nil {
+					result.Details = hookResult.Details
+				}
+				if hookResult.IsError != nil {
+					isError = *hookResult.IsError
 				}
 			}
 		}
