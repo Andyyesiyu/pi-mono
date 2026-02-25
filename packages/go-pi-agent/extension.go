@@ -15,6 +15,7 @@ type ExtensionManifest struct {
 	Description string `json:"description,omitempty"`
 	Version     string `json:"version,omitempty"`
 	Type        string `json:"type,omitempty"`       // "process" for subprocess extensions
+	Protocol    string `json:"protocol,omitempty"`    // "grpc" or "jsonrpc" (default: "jsonrpc")
 	EntryPoint  string `json:"entryPoint,omitempty"` // executable path for process extensions
 }
 
@@ -27,9 +28,11 @@ type Extension struct {
 	State    map[string]any
 	OnReload func(ext *Extension) error
 
-	// Process is non-nil for subprocess extensions (Type="process").
-	// It manages the child process and proxies hooks/tools over JSON-RPC.
+	// Process is non-nil for JSON-RPC subprocess extensions (Protocol="jsonrpc").
 	Process *ProcessExtension
+
+	// GRPCProcess is non-nil for gRPC subprocess extensions (Protocol="grpc").
+	GRPCProcess *GRPCProcessExtension
 }
 
 // ExtensionManager manages loading, state, and hot-reloading of extensions.
@@ -224,6 +227,10 @@ func (em *ExtensionManager) ReloadAll() error {
 // StartProcessExtension starts a process extension by ID.
 // This launches the subprocess, performs the handshake, and wires up
 // hooks and tools from the subprocess into the Extension struct.
+//
+// The protocol is determined by manifest.Protocol:
+//   - "grpc": gRPC over localhost TCP (extension prints handshake to stdout)
+//   - "jsonrpc" or "": JSON-RPC 2.0 over stdin/stdout (default)
 func (em *ExtensionManager) StartProcessExtension(id string) error {
 	em.mu.RLock()
 	ext, ok := em.extensions[id]
@@ -236,18 +243,35 @@ func (em *ExtensionManager) StartProcessExtension(id string) error {
 		return fmt.Errorf("extension %s is not a process extension", id)
 	}
 
+	if ext.Manifest.Protocol == GRPCProtocol {
+		return em.startGRPCExtension(ext)
+	}
+	return em.startJSONRPCExtension(ext)
+}
+
+func (em *ExtensionManager) startJSONRPCExtension(ext *Extension) error {
 	proc := NewProcessExtension(ext)
 	if err := proc.Start(); err != nil {
 		return err
 	}
-
 	ext.Process = proc
 	ext.Hooks = proc.BuildHooks()
 	ext.Tools = proc.BuildTools()
 	return nil
 }
 
-// StopProcessExtensions stops all running process extensions.
+func (em *ExtensionManager) startGRPCExtension(ext *Extension) error {
+	proc := NewGRPCProcessExtension(ext)
+	if err := proc.Start(); err != nil {
+		return err
+	}
+	ext.GRPCProcess = proc
+	ext.Hooks = proc.BuildHooks()
+	ext.Tools = proc.BuildTools()
+	return nil
+}
+
+// StopProcessExtensions stops all running process extensions (both gRPC and JSON-RPC).
 func (em *ExtensionManager) StopProcessExtensions() {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
@@ -255,6 +279,9 @@ func (em *ExtensionManager) StopProcessExtensions() {
 	for _, ext := range em.extensions {
 		if ext.Process != nil && ext.Process.IsRunning() {
 			ext.Process.Stop()
+		}
+		if ext.GRPCProcess != nil && ext.GRPCProcess.IsRunning() {
+			ext.GRPCProcess.Stop()
 		}
 	}
 }
