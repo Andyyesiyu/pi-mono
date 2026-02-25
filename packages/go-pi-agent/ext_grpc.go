@@ -38,7 +38,11 @@ const (
 //  2. Prints handshake: "PLUGIN|1|tcp|127.0.0.1:PORT|grpc"
 //  3. Serves the ExtensionService gRPC interface
 //
-// The host reads the handshake, dials gRPC, and proxies hooks/tools.
+// The host:
+//  1. Reads the handshake, dials gRPC to the extension
+//  2. Starts a HostService gRPC server for callbacks (SetState/Log)
+//  3. Sends the host address in InitializeRequest.host_address
+//  4. Proxies hooks and tools
 type GRPCProcessExtension struct {
 	stateMu sync.Mutex
 	cmd     *exec.Cmd
@@ -47,6 +51,9 @@ type GRPCProcessExtension struct {
 	stdin   io.WriteCloser
 	stderr  io.ReadCloser
 
+	// Host-side gRPC server for HostService callbacks.
+	hostServer *hostGRPCServer
+
 	subscribedHooks map[string]bool
 	toolDefs        []*extpb.ToolDefinition
 
@@ -54,6 +61,12 @@ type GRPCProcessExtension struct {
 	timeout time.Duration
 	done    chan struct{}
 	started bool
+
+	// OnError is called when a hook/call fails. Set before Start().
+	OnError ExtensionErrorHandler
+
+	// OnLog is called when the extension sends a log message. Set before Start().
+	OnLog ExtensionLogHandler
 
 	stderrBuf []byte
 	stderrMu  sync.Mutex
@@ -70,7 +83,7 @@ func NewGRPCProcessExtension(ext *Extension) *GRPCProcessExtension {
 }
 
 // Start launches the extension subprocess, reads the handshake, dials gRPC,
-// and performs the Initialize RPC.
+// starts the HostService server, and performs the Initialize RPC.
 func (g *GRPCProcessExtension) Start() error {
 	g.stateMu.Lock()
 	if g.started {
@@ -119,6 +132,14 @@ func (g *GRPCProcessExtension) Start() error {
 
 	go g.drainStderr()
 
+	// Start HostService gRPC server for callbacks.
+	hostSrv, err := startHostServiceServer(g.ext, g.OnLog, g.OnError)
+	if err != nil {
+		g.Stop()
+		return fmt.Errorf("start host service for %s: %w", g.ext.Manifest.ID, err)
+	}
+	g.hostServer = hostSrv
+
 	// Read handshake line from stdout.
 	addr, err := g.readHandshake(stdoutPipe)
 	if err != nil {
@@ -126,7 +147,7 @@ func (g *GRPCProcessExtension) Start() error {
 		return fmt.Errorf("handshake for %s: %w", g.ext.Manifest.ID, err)
 	}
 
-	// Dial gRPC.
+	// Dial gRPC to the extension.
 	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 	defer cancel()
 
@@ -141,7 +162,7 @@ func (g *GRPCProcessExtension) Start() error {
 	g.conn = conn
 	g.client = extpb.NewExtensionServiceClient(conn)
 
-	// Initialize.
+	// Initialize with host address.
 	initResp, err := g.initialize()
 	if err != nil {
 		g.Stop()
@@ -169,7 +190,6 @@ func (g *GRPCProcessExtension) readHandshake(stdout io.Reader) (string, error) {
 		if scanner.Scan() {
 			line := scanner.Text()
 			parts := strings.Split(line, "|")
-			// Expected: PLUGIN|<version>|tcp|<address>|grpc
 			if len(parts) != 5 || parts[0] != "PLUGIN" || parts[4] != "grpc" {
 				ch <- result{err: fmt.Errorf("invalid handshake: %q", line)}
 				return
@@ -194,19 +214,24 @@ func (g *GRPCProcessExtension) initialize() (*extpb.InitializeResponse, error) {
 
 	state, _ := structpb.NewStruct(g.ext.State)
 
-	resp, err := g.client.Initialize(ctx, &extpb.InitializeRequest{
+	req := &extpb.InitializeRequest{
 		ProtocolVersion: ExtProtocolVersion,
 		ExtensionId:     g.ext.Manifest.ID,
 		ExtensionDir:    g.ext.Dir,
 		State:           state,
-	})
+	}
+	if g.hostServer != nil {
+		req.HostAddress = g.hostServer.addr
+	}
+
+	resp, err := g.client.Initialize(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	return resp, nil
 }
 
-// Stop shuts down the extension subprocess.
+// Stop shuts down the extension subprocess and host server.
 func (g *GRPCProcessExtension) Stop() error {
 	g.stateMu.Lock()
 	defer g.stateMu.Unlock()
@@ -215,7 +240,6 @@ func (g *GRPCProcessExtension) Stop() error {
 		return nil
 	}
 
-	// Try graceful shutdown via RPC.
 	if g.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		g.client.Shutdown(ctx, &extpb.Empty{})
@@ -226,12 +250,14 @@ func (g *GRPCProcessExtension) Stop() error {
 		g.conn.Close()
 	}
 
-	// Close stdin to signal the subprocess.
+	if g.hostServer != nil {
+		g.hostServer.Stop()
+	}
+
 	if g.stdin != nil {
 		g.stdin.Close()
 	}
 
-	// Wait for process exit.
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- g.cmd.Wait() }()
 
@@ -280,9 +306,17 @@ func (g *GRPCProcessExtension) drainStderr() {
 	}
 }
 
+// reportError reports a hook/tool error via the OnError handler.
+func (g *GRPCProcessExtension) reportError(operation string, err error) {
+	if g.OnError != nil {
+		g.OnError(g.ext.Manifest.ID, operation, err)
+	}
+}
+
 // --- Hook proxying ---
 
 // BuildHooks generates ExtensionHooks that proxy to the gRPC subprocess.
+// All errors are reported via OnError instead of being silently swallowed.
 func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 	hooks := &ExtensionHooks{}
 
@@ -297,6 +331,7 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 				Input:      input,
 			})
 			if err != nil {
+				g.reportError("hook/tool_call", err)
 				return nil
 			}
 			return &ToolCallHookResult{Block: resp.Block, Reason: resp.Reason}
@@ -316,6 +351,7 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 				IsError:    event.IsError,
 			})
 			if err != nil {
+				g.reportError("hook/tool_result", err)
 				return nil
 			}
 			result := &ToolResultHookResult{}
@@ -338,6 +374,7 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 				Messages: marshalMessagesBytes(event.Messages),
 			})
 			if err != nil {
+				g.reportError("hook/context", err)
 				return nil
 			}
 			if resp.Messages == nil {
@@ -355,6 +392,7 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 				SystemPrompt: event.SystemPrompt,
 			})
 			if err != nil {
+				g.reportError("hook/before_agent_start", err)
 				return nil
 			}
 			if resp.SystemPrompt == "" {
@@ -368,7 +406,9 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.AgentStart = append(hooks.AgentStart, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 			defer cancel()
-			g.client.OnAgentStart(ctx, &extpb.Empty{})
+			if _, err := g.client.OnAgentStart(ctx, &extpb.Empty{}); err != nil {
+				g.reportError("hook/agent_start", err)
+			}
 		})
 	}
 
@@ -376,9 +416,11 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.AgentEnd = append(hooks.AgentEnd, func(event *AgentEndHookEvent) {
 			ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 			defer cancel()
-			g.client.OnAgentEnd(ctx, &extpb.AgentEndEvent{
+			if _, err := g.client.OnAgentEnd(ctx, &extpb.AgentEndEvent{
 				Messages: marshalMessagesBytes(event.Messages),
-			})
+			}); err != nil {
+				g.reportError("hook/agent_end", err)
+			}
 		})
 	}
 
@@ -386,7 +428,9 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.TurnStart = append(hooks.TurnStart, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 			defer cancel()
-			g.client.OnTurnStart(ctx, &extpb.Empty{})
+			if _, err := g.client.OnTurnStart(ctx, &extpb.Empty{}); err != nil {
+				g.reportError("hook/turn_start", err)
+			}
 		})
 	}
 
@@ -400,10 +444,12 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 				b, _ := json.Marshal(r)
 				resultsJSON = append(resultsJSON, b)
 			}
-			g.client.OnTurnEnd(ctx, &extpb.TurnEndEvent{
+			if _, err := g.client.OnTurnEnd(ctx, &extpb.TurnEndEvent{
 				TurnMessage: turnJSON,
 				ToolResults: resultsJSON,
-			})
+			}); err != nil {
+				g.reportError("hook/turn_end", err)
+			}
 		})
 	}
 
@@ -411,7 +457,9 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.SessionStart = append(hooks.SessionStart, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 			defer cancel()
-			g.client.OnSessionStart(ctx, &extpb.Empty{})
+			if _, err := g.client.OnSessionStart(ctx, &extpb.Empty{}); err != nil {
+				g.reportError("hook/session_start", err)
+			}
 		})
 	}
 
@@ -419,7 +467,9 @@ func (g *GRPCProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.SessionShutdown = append(hooks.SessionShutdown, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
 			defer cancel()
-			g.client.OnSessionShutdown(ctx, &extpb.Empty{})
+			if _, err := g.client.OnSessionShutdown(ctx, &extpb.Empty{}); err != nil {
+				g.reportError("hook/session_shutdown", err)
+			}
 		})
 	}
 

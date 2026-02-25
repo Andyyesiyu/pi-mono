@@ -58,9 +58,19 @@ type ProcessExtension struct {
 	done    chan struct{}
 	started bool
 
+	// OnError is called when a hook/call fails. Set before Start().
+	OnError ExtensionErrorHandler
+
 	// ErrLog collects stderr output for diagnostics.
 	stderrBuf []byte
 	stderrMu  sync.Mutex
+}
+
+// reportError reports a hook/tool error via the OnError handler.
+func (p *ProcessExtension) reportError(operation string, err error) {
+	if p.OnError != nil {
+		p.OnError(p.ext.Manifest.ID, operation, err)
+	}
 }
 
 // NewProcessExtension creates a ProcessExtension for the given Extension.
@@ -367,10 +377,12 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 			}
 			resp, err := p.call(MethodHookToolCall, wireEvent)
 			if err != nil {
+				p.reportError("hook/tool_call", err)
 				return nil
 			}
 			var result WireToolCallHookResult
-			if json.Unmarshal(resp, &result) != nil {
+			if err := json.Unmarshal(resp, &result); err != nil {
+				p.reportError("hook/tool_call", err)
 				return nil
 			}
 			return &ToolCallHookResult{Block: result.Block, Reason: result.Reason}
@@ -390,10 +402,12 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 			}
 			resp, err := p.call(MethodHookToolResult, wireEvent)
 			if err != nil {
+				p.reportError("hook/tool_result", err)
 				return nil
 			}
 			var wireResult WireToolResultHookResult
-			if json.Unmarshal(resp, &wireResult) != nil {
+			if err := json.Unmarshal(resp, &wireResult); err != nil {
+				p.reportError("hook/tool_result", err)
 				return nil
 			}
 			result := &ToolResultHookResult{IsError: wireResult.IsError}
@@ -410,10 +424,12 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 			wireEvent := WireContextHookEvent{Messages: msgsJSON}
 			resp, err := p.call(MethodHookContext, wireEvent)
 			if err != nil {
+				p.reportError("hook/context", err)
 				return nil
 			}
 			var wireResult WireContextHookResult
-			if json.Unmarshal(resp, &wireResult) != nil {
+			if err := json.Unmarshal(resp, &wireResult); err != nil {
+				p.reportError("hook/context", err)
 				return nil
 			}
 			if wireResult.Messages == nil {
@@ -428,10 +444,12 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 			wireEvent := WireBeforeAgentStartHookEvent{SystemPrompt: event.SystemPrompt}
 			resp, err := p.call(MethodHookBeforeAgentStart, wireEvent)
 			if err != nil {
+				p.reportError("hook/before_agent_start", err)
 				return nil
 			}
 			var wireResult WireBeforeAgentStartHookResult
-			if json.Unmarshal(resp, &wireResult) != nil {
+			if err := json.Unmarshal(resp, &wireResult); err != nil {
+				p.reportError("hook/before_agent_start", err)
 				return nil
 			}
 			if wireResult.SystemPrompt == "" {
@@ -443,7 +461,9 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 
 	if p.subscribedHooks["agent_start"] {
 		hooks.AgentStart = append(hooks.AgentStart, func() {
-			_ = p.notify(MethodHookAgentStart, nil)
+			if err := p.notify(MethodHookAgentStart, nil); err != nil {
+				p.reportError("hook/agent_start", err)
+			}
 		})
 	}
 
@@ -451,13 +471,17 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 		hooks.AgentEnd = append(hooks.AgentEnd, func(event *AgentEndHookEvent) {
 			msgsJSON := marshalMessages(event.Messages)
 			wireEvent := WireAgentEndHookEvent{Messages: msgsJSON}
-			_ = p.notify(MethodHookAgentEnd, wireEvent)
+			if err := p.notify(MethodHookAgentEnd, wireEvent); err != nil {
+				p.reportError("hook/agent_end", err)
+			}
 		})
 	}
 
 	if p.subscribedHooks["turn_start"] {
 		hooks.TurnStart = append(hooks.TurnStart, func() {
-			_ = p.notify(MethodHookTurnStart, nil)
+			if err := p.notify(MethodHookTurnStart, nil); err != nil {
+				p.reportError("hook/turn_start", err)
+			}
 		})
 	}
 
@@ -470,19 +494,25 @@ func (p *ProcessExtension) BuildHooks() *ExtensionHooks {
 				resultsJSON = append(resultsJSON, b)
 			}
 			wireEvent := WireTurnEndHookEvent{TurnMessage: turnJSON, ToolResults: resultsJSON}
-			_ = p.notify(MethodHookTurnEnd, wireEvent)
+			if err := p.notify(MethodHookTurnEnd, wireEvent); err != nil {
+				p.reportError("hook/turn_end", err)
+			}
 		})
 	}
 
 	if p.subscribedHooks["session_start"] {
 		hooks.SessionStart = append(hooks.SessionStart, func() {
-			_ = p.notify(MethodHookSessionStart, nil)
+			if err := p.notify(MethodHookSessionStart, nil); err != nil {
+				p.reportError("hook/session_start", err)
+			}
 		})
 	}
 
 	if p.subscribedHooks["session_shutdown"] {
 		hooks.SessionShutdown = append(hooks.SessionShutdown, func() {
-			_ = p.notify(MethodHookSessionShutdown, nil)
+			if err := p.notify(MethodHookSessionShutdown, nil); err != nil {
+				p.reportError("hook/session_shutdown", err)
+			}
 		})
 	}
 

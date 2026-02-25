@@ -65,8 +65,11 @@ type InitializeRequest struct {
 	ExtensionId     string                 `protobuf:"bytes,2,opt,name=extension_id,json=extensionId,proto3" json:"extension_id,omitempty"`
 	ExtensionDir    string                 `protobuf:"bytes,3,opt,name=extension_dir,json=extensionDir,proto3" json:"extension_dir,omitempty"`
 	State           *structpb.Struct       `protobuf:"bytes,4,opt,name=state,proto3" json:"state,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// host_address is the gRPC address of the HostService server.
+	// Extensions can dial this address to call SetState/Log on the host.
+	HostAddress   string `protobuf:"bytes,5,opt,name=host_address,json=hostAddress,proto3" json:"host_address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InitializeRequest) Reset() {
@@ -125,6 +128,13 @@ func (x *InitializeRequest) GetState() *structpb.Struct {
 		return x.State
 	}
 	return nil
+}
+
+func (x *InitializeRequest) GetHostAddress() string {
+	if x != nil {
+		return x.HostAddress
+	}
+	return ""
 }
 
 type InitializeResponse struct {
@@ -1194,12 +1204,13 @@ var File_extension_proto protoreflect.FileDescriptor
 const file_extension_proto_rawDesc = "" +
 	"\n" +
 	"\x0fextension.proto\x12\x0fpi.agent.ext.v1\x1a\x1cgoogle/protobuf/struct.proto\"\a\n" +
-	"\x05Empty\"\xb5\x01\n" +
+	"\x05Empty\"\xd8\x01\n" +
 	"\x11InitializeRequest\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12!\n" +
 	"\fextension_id\x18\x02 \x01(\tR\vextensionId\x12#\n" +
 	"\rextension_dir\x18\x03 \x01(\tR\fextensionDir\x12-\n" +
-	"\x05state\x18\x04 \x01(\v2\x17.google.protobuf.StructR\x05state\"\x8c\x01\n" +
+	"\x05state\x18\x04 \x01(\v2\x17.google.protobuf.StructR\x05state\x12!\n" +
+	"\fhost_address\x18\x05 \x01(\tR\vhostAddress\"\x8c\x01\n" +
 	"\x12InitializeResponse\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12\x14\n" +
 	"\x05hooks\x18\x02 \x03(\tR\x05hooks\x125\n" +

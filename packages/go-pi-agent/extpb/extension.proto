@@ -74,6 +74,9 @@ message InitializeRequest {
   string extension_id = 2;
   string extension_dir = 3;
   google.protobuf.Struct state = 4;
+  // host_address is the gRPC address of the HostService server.
+  // Extensions can dial this address to call SetState/Log on the host.
+  string host_address = 5;
 }
 
 message InitializeResponse {

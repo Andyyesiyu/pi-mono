@@ -37,18 +37,32 @@ type Extension struct {
 
 // ExtensionManager manages loading, state, and hot-reloading of extensions.
 type ExtensionManager struct {
-	mu         sync.RWMutex
-	extensions map[string]*Extension
-	session    *Session
-	extDir     string
+	mu          sync.RWMutex
+	extensions  map[string]*Extension
+	supervisors map[string]*extensionSupervisor
+	session     *Session
+	extDir      string
+
+	// OnError is called when any extension reports an error (hook failures,
+	// supervision events, etc.). Set before starting extensions.
+	OnError ExtensionErrorHandler
+
+	// OnLog is called when a gRPC extension sends a log message via HostService.
+	// Set before starting extensions.
+	OnLog ExtensionLogHandler
+
+	// SupervisorConfig controls auto-restart behavior.
+	// Zero value disables supervision.
+	SupervisorConfig *SupervisorConfig
 }
 
 // NewExtensionManager creates a new extension manager.
 func NewExtensionManager(extensionsDir string, session *Session) *ExtensionManager {
 	return &ExtensionManager{
-		extensions: make(map[string]*Extension),
-		session:    session,
-		extDir:     extensionsDir,
+		extensions:  make(map[string]*Extension),
+		supervisors: make(map[string]*extensionSupervisor),
+		session:     session,
+		extDir:      extensionsDir,
 	}
 }
 
@@ -251,6 +265,7 @@ func (em *ExtensionManager) StartProcessExtension(id string) error {
 
 func (em *ExtensionManager) startJSONRPCExtension(ext *Extension) error {
 	proc := NewProcessExtension(ext)
+	proc.OnError = em.OnError
 	if err := proc.Start(); err != nil {
 		return err
 	}
@@ -262,6 +277,8 @@ func (em *ExtensionManager) startJSONRPCExtension(ext *Extension) error {
 
 func (em *ExtensionManager) startGRPCExtension(ext *Extension) error {
 	proc := NewGRPCProcessExtension(ext)
+	proc.OnError = em.OnError
+	proc.OnLog = em.OnLog
 	if err := proc.Start(); err != nil {
 		return err
 	}
@@ -271,8 +288,55 @@ func (em *ExtensionManager) startGRPCExtension(ext *Extension) error {
 	return nil
 }
 
-// StopProcessExtensions stops all running process extensions (both gRPC and JSON-RPC).
+// StartAllProcessExtensions starts all registered process extensions.
+// Non-process extensions are silently skipped.
+// If SupervisorConfig is set, each extension gets auto-restart supervision.
+func (em *ExtensionManager) StartAllProcessExtensions() error {
+	em.mu.RLock()
+	var processExts []*Extension
+	for _, ext := range em.extensions {
+		if ext.Manifest.Type == ProcessExtensionType {
+			processExts = append(processExts, ext)
+		}
+	}
+	em.mu.RUnlock()
+
+	for _, ext := range processExts {
+		if err := em.StartProcessExtension(ext.Manifest.ID); err != nil {
+			return fmt.Errorf("start %s: %w", ext.Manifest.ID, err)
+		}
+
+		// Start supervisor if configured.
+		if em.SupervisorConfig != nil {
+			sv := newExtensionSupervisor(ext, *em.SupervisorConfig, em.OnError)
+			sv.Start()
+			em.mu.Lock()
+			em.supervisors[ext.Manifest.ID] = sv
+			em.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+// LoadAndStartFromDir loads extensions from disk and starts all process extensions.
+// This is the single-call entry point for zero-friction extension setup.
+func (em *ExtensionManager) LoadAndStartFromDir() error {
+	if err := em.LoadFromDir(); err != nil {
+		return err
+	}
+	return em.StartAllProcessExtensions()
+}
+
+// StopProcessExtensions stops all running process extensions and their supervisors.
 func (em *ExtensionManager) StopProcessExtensions() {
+	em.mu.Lock()
+	// Stop supervisors first to prevent restarts during shutdown.
+	for id, sv := range em.supervisors {
+		sv.Stop()
+		delete(em.supervisors, id)
+	}
+	em.mu.Unlock()
+
 	em.mu.RLock()
 	defer em.mu.RUnlock()
 
