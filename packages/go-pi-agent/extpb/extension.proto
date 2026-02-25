@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package pi.agent.ext.v1;
+
+option go_package = "github.com/nickolaev/pi-mono/packages/go-pi-agent/extpb";
+
+import "google/protobuf/struct.proto";
+
+// ExtensionService is implemented by extension subprocesses.
+// The host launches the extension, connects via gRPC, and calls these RPCs
+// to dispatch hooks and execute tools.
+//
+// Extension authors implement this interface. Use extpb.Serve() to start
+// the gRPC server with the correct handshake protocol.
+service ExtensionService {
+  // --- Lifecycle ---
+
+  // Initialize performs the handshake. The extension declares which hooks
+  // it subscribes to and which tools it provides.
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+
+  // Shutdown signals the extension to clean up and exit.
+  rpc Shutdown(Empty) returns (Empty);
+
+  // --- Hooks (request/response — can modify behavior) ---
+
+  // OnToolCall is invoked before a tool executes. Return block=true to prevent it.
+  rpc OnToolCall(ToolCallHookEvent) returns (ToolCallHookResult);
+
+  // OnToolResult is invoked after a tool executes. Can modify the result.
+  rpc OnToolResult(ToolResultHookEvent) returns (ToolResultHookResult);
+
+  // OnContext is invoked before sending messages to the LLM. Can modify messages.
+  rpc OnContext(ContextHookEvent) returns (ContextHookResult);
+
+  // OnBeforeAgentStart is invoked before the agent loop begins. Can modify system prompt.
+  rpc OnBeforeAgentStart(BeforeAgentStartHookEvent) returns (BeforeAgentStartHookResult);
+
+  // --- Hooks (fire-and-forget — observational only) ---
+
+  rpc OnAgentStart(Empty) returns (Empty);
+  rpc OnAgentEnd(AgentEndEvent) returns (Empty);
+  rpc OnTurnStart(Empty) returns (Empty);
+  rpc OnTurnEnd(TurnEndEvent) returns (Empty);
+  rpc OnSessionStart(Empty) returns (Empty);
+  rpc OnSessionShutdown(Empty) returns (Empty);
+
+  // --- Tool execution ---
+
+  // ExecuteTool runs a tool registered by this extension.
+  // Returns a stream: zero or more progress updates followed by a final result.
+  rpc ExecuteTool(ToolExecuteRequest) returns (stream ToolExecuteResponse);
+}
+
+// HostService is implemented by the host process. Extensions can call back
+// into the host to update state or emit logs.
+service HostService {
+  // SetState persists a key-value pair in the extension's state store.
+  rpc SetState(StateSetRequest) returns (Empty);
+
+  // Log sends a structured log message to the host.
+  rpc Log(LogRequest) returns (Empty);
+}
+
+// Empty is a placeholder for RPCs with no meaningful request/response.
+message Empty {}
+
+// ============================================================
+// Lifecycle
+// ============================================================
+
+message InitializeRequest {
+  string protocol_version = 1;
+  string extension_id = 2;
+  string extension_dir = 3;
+  google.protobuf.Struct state = 4;
+  // host_address is the gRPC address of the HostService server.
+  // Extensions can dial this address to call SetState/Log on the host.
+  string host_address = 5;
+}
+
+message InitializeResponse {
+  string protocol_version = 1;
+  repeated string hooks = 2;
+  repeated ToolDefinition tools = 3;
+}
+
+message ToolDefinition {
+  string name = 1;
+  string label = 2;
+  string description = 3;
+  // JSON Schema for the tool's parameters, encoded as a Struct.
+  google.protobuf.Struct parameters = 4;
+}
+
+// ============================================================
+// Hook events and results
+// ============================================================
+
+message ToolCallHookEvent {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct input = 3;
+}
+
+message ToolCallHookResult {
+  bool block = 1;
+  string reason = 2;
+}
+
+message ToolResultHookEvent {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct input = 3;
+  repeated ContentBlock content = 4;
+  bool is_error = 5;
+}
+
+message ToolResultHookResult {
+  repeated ContentBlock content = 1;
+  optional bool is_error = 2;
+}
+
+message ContextHookEvent {
+  // Messages are JSON-encoded AgentMessages.
+  // We use bytes to preserve the exact serialization format.
+  repeated bytes messages = 1;
+}
+
+message ContextHookResult {
+  repeated bytes messages = 1;
+}
+
+message BeforeAgentStartHookEvent {
+  string system_prompt = 1;
+}
+
+message BeforeAgentStartHookResult {
+  string system_prompt = 1;
+}
+
+message AgentEndEvent {
+  repeated bytes messages = 1;
+}
+
+message TurnEndEvent {
+  bytes turn_message = 1;
+  repeated bytes tool_results = 2;
+}
+
+// ============================================================
+// Content blocks
+// ============================================================
+
+message ContentBlock {
+  oneof block {
+    TextContent text = 1;
+    ImageContent image = 2;
+  }
+}
+
+message TextContent {
+  string text = 1;
+}
+
+message ImageContent {
+  string data = 1;
+  string mime_type = 2;
+}
+
+// ============================================================
+// Tool execution
+// ============================================================
+
+message ToolExecuteRequest {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct params = 3;
+}
+
+message ToolExecuteResponse {
+  // If true, this is a progress update (not the final result).
+  bool is_progress = 1;
+  repeated ContentBlock content = 2;
+  google.protobuf.Struct details = 3;
+  bool is_error = 4;
+}
+
+// ============================================================
+// Host callbacks
+// ============================================================
+
+message StateSetRequest {
+  string key = 1;
+  google.protobuf.Value value = 2;
+}
+
+message LogRequest {
+  string level = 1;   // "debug", "info", "warn", "error"
+  string message = 2;
+  google.protobuf.Struct fields = 3;
+}
