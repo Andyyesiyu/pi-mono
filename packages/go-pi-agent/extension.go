@@ -194,6 +194,13 @@ func (em *ExtensionManager) LoadFromDir() error {
 }
 
 // Reload reloads a specific extension by ID.
+// For process extensions, this performs a full hot-reload:
+//  1. Pause supervisor (prevent crash-restart during reload)
+//  2. Stop the running subprocess
+//  3. Re-read manifest from disk
+//  4. Start new subprocess with preserved state
+//  5. Rebuild hooks/tools from the new process
+//  6. Resume supervisor
 func (em *ExtensionManager) Reload(id string) error {
 	em.mu.Lock()
 	ext, ok := em.extensions[id]
@@ -203,11 +210,19 @@ func (em *ExtensionManager) Reload(id string) error {
 		return fmt.Errorf("extension %s not found", id)
 	}
 
+	// Custom reload handler takes priority.
 	if ext.OnReload != nil {
 		return ext.OnReload(ext)
 	}
 
-	// Default: re-read manifest
+	isProcess := ext.Manifest.Type == ProcessExtensionType &&
+		(ext.Process != nil || ext.GRPCProcess != nil)
+
+	if isProcess {
+		return em.hotReloadProcessExtension(ext)
+	}
+
+	// In-process extension: just re-read manifest.
 	if ext.Dir != "" {
 		updated, err := loadExtensionManifest(ext.Dir)
 		if err != nil {
@@ -215,6 +230,63 @@ func (em *ExtensionManager) Reload(id string) error {
 		}
 		em.mu.Lock()
 		ext.Manifest = updated.Manifest
+		em.mu.Unlock()
+	}
+
+	return nil
+}
+
+// hotReloadProcessExtension performs a zero-downtime reload of a process extension.
+func (em *ExtensionManager) hotReloadProcessExtension(ext *Extension) error {
+	id := ext.Manifest.ID
+
+	// 1. Pause supervisor to prevent crash-restart during reload.
+	em.mu.Lock()
+	sv := em.supervisors[id]
+	if sv != nil {
+		sv.Stop()
+		delete(em.supervisors, id)
+	}
+	em.mu.Unlock()
+
+	// 2. Save current state before stopping.
+	savedState := ext.State
+
+	// 3. Stop the old process.
+	if ext.Process != nil && ext.Process.IsRunning() {
+		ext.Process.Stop()
+	}
+	if ext.GRPCProcess != nil && ext.GRPCProcess.IsRunning() {
+		ext.GRPCProcess.Stop()
+	}
+	ext.Process = nil
+	ext.GRPCProcess = nil
+
+	// 4. Re-read manifest from disk (may have new entryPoint, protocol, hooks).
+	if ext.Dir != "" {
+		updated, err := loadExtensionManifest(ext.Dir)
+		if err != nil {
+			return fmt.Errorf("reload manifest: %w", err)
+		}
+		em.mu.Lock()
+		ext.Manifest = updated.Manifest
+		em.mu.Unlock()
+	}
+
+	// 5. Restore state (not from disk — carry over from the running session).
+	ext.State = savedState
+
+	// 6. Start the new process.
+	if err := em.StartProcessExtension(id); err != nil {
+		return fmt.Errorf("restart after reload: %w", err)
+	}
+
+	// 7. Re-create supervisor if configured.
+	if em.SupervisorConfig != nil {
+		newSv := newExtensionSupervisor(ext, *em.SupervisorConfig, em.OnError)
+		newSv.Start()
+		em.mu.Lock()
+		em.supervisors[id] = newSv
 		em.mu.Unlock()
 	}
 

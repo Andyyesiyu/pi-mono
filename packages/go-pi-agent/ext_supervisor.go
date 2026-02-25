@@ -59,13 +59,16 @@ func (s *extensionSupervisor) Start() {
 	go s.watchLoop()
 }
 
-// Stop terminates the supervisor and the underlying process.
+// Stop terminates the supervisor. Safe to call multiple times.
 func (s *extensionSupervisor) Stop() {
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
 	s.stopped = true
-	s.mu.Unlock()
-
 	close(s.done)
+	s.mu.Unlock()
 }
 
 func (s *extensionSupervisor) watchLoop() {
