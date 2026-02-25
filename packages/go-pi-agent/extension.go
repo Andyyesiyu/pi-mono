@@ -14,7 +14,8 @@ type ExtensionManifest struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Version     string `json:"version,omitempty"`
-	EntryPoint  string `json:"entryPoint,omitempty"`
+	Type        string `json:"type,omitempty"`       // "process" for subprocess extensions
+	EntryPoint  string `json:"entryPoint,omitempty"` // executable path for process extensions
 }
 
 // Extension is a loaded extension that can register tools, hooks, and persist state.
@@ -25,6 +26,10 @@ type Extension struct {
 	Hooks    *ExtensionHooks
 	State    map[string]any
 	OnReload func(ext *Extension) error
+
+	// Process is non-nil for subprocess extensions (Type="process").
+	// It manages the child process and proxies hooks/tools over JSON-RPC.
+	Process *ProcessExtension
 }
 
 // ExtensionManager manages loading, state, and hot-reloading of extensions.
@@ -214,6 +219,44 @@ func (em *ExtensionManager) ReloadAll() error {
 		}
 	}
 	return nil
+}
+
+// StartProcessExtension starts a process extension by ID.
+// This launches the subprocess, performs the handshake, and wires up
+// hooks and tools from the subprocess into the Extension struct.
+func (em *ExtensionManager) StartProcessExtension(id string) error {
+	em.mu.RLock()
+	ext, ok := em.extensions[id]
+	em.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("extension %s not found", id)
+	}
+	if ext.Manifest.Type != ProcessExtensionType {
+		return fmt.Errorf("extension %s is not a process extension", id)
+	}
+
+	proc := NewProcessExtension(ext)
+	if err := proc.Start(); err != nil {
+		return err
+	}
+
+	ext.Process = proc
+	ext.Hooks = proc.BuildHooks()
+	ext.Tools = proc.BuildTools()
+	return nil
+}
+
+// StopProcessExtensions stops all running process extensions.
+func (em *ExtensionManager) StopProcessExtensions() {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+
+	for _, ext := range em.extensions {
+		if ext.Process != nil && ext.Process.IsRunning() {
+			ext.Process.Stop()
+		}
+	}
 }
 
 // SaveAllState persists all extension states to the session.
